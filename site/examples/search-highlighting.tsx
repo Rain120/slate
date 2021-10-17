@@ -9,7 +9,7 @@ import { Icon, Toolbar } from '../components'
 const SearchHighlightingExample = () => {
   const [value, setValue] = useState<Descendant[]>(initialValue)
   const [search, setSearch] = useState<string | undefined>()
-  const editor = useMemo(() => withHistory(withReact(createEditor())), [])
+  const editor = useMemo(() => withReact(withHistory(createEditor())), [])
   const decorate = useCallback(
     ([node, path]) => {
       const ranges = []
@@ -48,8 +48,8 @@ const SearchHighlightingExample = () => {
           <Icon
             className={css`
               position: absolute;
-              top: 0.5em;
-              left: 0.5em;
+              top: 0.3em;
+              left: 0.4em;
               color: #ccc;
             `}
           >
@@ -60,7 +60,7 @@ const SearchHighlightingExample = () => {
             placeholder="Search the text..."
             onChange={e => setSearch(e.target.value)}
             className={css`
-              padding-left: 2em;
+              padding-left: 2.5em;
               width: 100%;
             `}
           />
@@ -75,6 +75,7 @@ const Leaf = ({ attributes, children, leaf }) => {
   return (
     <span
       {...attributes}
+      {...(leaf.highlight && { 'data-cy': 'search-highlighted' })}
       className={css`
         font-weight: ${leaf.bold && 'bold'};
         background-color: ${leaf.highlight && '#ffeeba'};

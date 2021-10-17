@@ -25,7 +25,7 @@ const RichTextExample = () => {
   const [value, setValue] = useState<Descendant[]>(initialValue)
   const renderElement = useCallback(props => <Element {...props} />, [])
   const renderLeaf = useCallback(props => <Leaf {...props} />, [])
-  const editor = useMemo(() => withHistory(withReact(createEditor())), [])
+  const editor = useMemo(() => withReact(withHistory(createEditor())), [])
 
   return (
     <Slate editor={editor} value={value} onChange={value => setValue(value)}>
@@ -66,9 +66,9 @@ const toggleBlock = (editor, format) => {
 
   Transforms.unwrapNodes(editor, {
     match: n =>
-      LIST_TYPES.includes(
-        !Editor.isEditor(n) && SlateElement.isElement(n) && n.type
-      ),
+      !Editor.isEditor(n) &&
+      SlateElement.isElement(n) &&
+      LIST_TYPES.includes(n.type),
     split: true,
   })
   const newProperties: Partial<SlateElement> = {
@@ -93,7 +93,11 @@ const toggleMark = (editor, format) => {
 }
 
 const isBlockActive = (editor, format) => {
+  const { selection } = editor
+  if (!selection) return false
+
   const [match] = Editor.nodes(editor, {
+    at: Editor.unhangRange(editor, selection),
     match: n =>
       !Editor.isEditor(n) && SlateElement.isElement(n) && n.type === format,
   })

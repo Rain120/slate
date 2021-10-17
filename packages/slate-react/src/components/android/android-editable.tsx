@@ -13,6 +13,7 @@ import {
   isDOMElement,
   isDOMNode,
   getDefaultView,
+  getClipboardData,
   isPlainTextOnlyPaste,
 } from '../../utils/dom'
 import {
@@ -123,6 +124,7 @@ export const AndroidEditable = (props: EditableProps): JSX.Element => {
       if (hasDomSelection && hasDomSelectionInEditor && selection) {
         const slateRange = ReactEditor.toSlateRange(editor, domSelection, {
           exactMatch: true,
+          suppressThrow: true,
         })
         if (slateRange && Range.equals(slateRange, selection)) {
           return
@@ -136,6 +138,7 @@ export const AndroidEditable = (props: EditableProps): JSX.Element => {
       if (selection && !ReactEditor.hasRange(editor, selection)) {
         editor.selection = ReactEditor.toSlateRange(editor, domSelection, {
           exactMatch: false,
+          suppressThrow: false,
         })
         return
       }
@@ -265,6 +268,7 @@ export const AndroidEditable = (props: EditableProps): JSX.Element => {
           if (anchorNodeSelectable && focusNodeSelectable) {
             const range = ReactEditor.toSlateRange(editor, domSelection, {
               exactMatch: false,
+              suppressThrow: false,
             })
             Transforms.select(editor, range)
           } else {
@@ -452,6 +456,8 @@ export const AndroidEditable = (props: EditableProps): JSX.Element => {
           )}
           onPaste={useCallback(
             (event: React.ClipboardEvent<HTMLDivElement>) => {
+              // this will make application/x-slate-fragment exist when onPaste attributes is passed
+              event.clipboardData = getClipboardData(event.clipboardData)
               // This unfortunately needs to be handled with paste events instead.
               if (
                 hasEditableTarget(editor, event.target) &&

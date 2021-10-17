@@ -6,11 +6,11 @@ import {
   ELEMENT_TO_NODE,
   IS_FOCUSED,
   IS_READ_ONLY,
-  KEY_TO_ELEMENT,
   NODE_TO_INDEX,
   NODE_TO_KEY,
   NODE_TO_PARENT,
   EDITOR_TO_WINDOW,
+  EDITOR_TO_KEY_TO_ELEMENT,
 } from '../utils/weak-maps'
 import {
   DOMElement,
@@ -24,7 +24,7 @@ import {
   normalizeDOMPoint,
   hasShadowRoot,
 } from '../utils/dom'
-import { IS_CHROME } from '../utils/environment'
+import { IS_CHROME, IS_FIREFOX } from '../utils/environment'
 
 /**
  * A React and DOM-specific version of the `Editor` interface.
@@ -106,23 +106,14 @@ export const ReactEditor = {
     const el = ReactEditor.toDOMNode(editor, editor)
     const root = el.getRootNode()
 
-    // The below exception will always be thrown for iframes because the document inside an iframe
-    // does not inherit it's prototype from the parent document, therefore we return early
-    if (el.ownerDocument !== document) return el.ownerDocument
+    if (
+      (root instanceof Document || root instanceof ShadowRoot) &&
+      root.getSelection != null
+    ) {
+      return root
+    }
 
-    if (!(root instanceof Document || root instanceof ShadowRoot))
-      throw new Error(
-        `Unable to find DocumentOrShadowRoot for editor element: ${el}`
-      )
-
-    // COMPAT: Only Chrome implements the DocumentOrShadowRoot mixin for
-    // ShadowRoot; other browsers still implement it on the Document
-    // interface. (2020/08/08)
-    // https://developer.mozilla.org/en-US/docs/Web/API/ShadowRoot#Properties
-    if (root.getSelection === undefined && el.ownerDocument !== null)
-      return el.ownerDocument
-
-    return root
+    return el.ownerDocument
   },
 
   /**
@@ -250,9 +241,10 @@ export const ReactEditor = {
    */
 
   toDOMNode(editor: ReactEditor, node: Node): HTMLElement {
+    const KEY_TO_ELEMENT = EDITOR_TO_KEY_TO_ELEMENT.get(editor)
     const domNode = Editor.isEditor(node)
       ? EDITOR_TO_ELEMENT.get(editor)
-      : KEY_TO_ELEMENT.get(ReactEditor.findKey(editor, node))
+      : KEY_TO_ELEMENT?.get(ReactEditor.findKey(editor, node))
 
     if (!domNode) {
       throw new Error(
@@ -438,6 +430,7 @@ export const ReactEditor = {
     // Resolve a Slate range from the DOM range.
     const range = ReactEditor.toSlateRange(editor, domRange, {
       exactMatch: false,
+      suppressThrow: false,
     })
     return range
   },
@@ -449,8 +442,12 @@ export const ReactEditor = {
   toSlatePoint<T extends boolean>(
     editor: ReactEditor,
     domPoint: DOMPoint,
-    exactMatch: T
+    options: {
+      exactMatch: T
+      suppressThrow: T
+    }
   ): T extends true ? Point | null : Point {
+    const { exactMatch, suppressThrow } = options
     const [nearestNode, nearestOffset] = exactMatch
       ? domPoint
       : normalizeDOMPoint(domPoint)
@@ -471,6 +468,7 @@ export const ReactEditor = {
         const range = window.document.createRange()
         range.setStart(textNode, 0)
         range.setEnd(nearestNode, nearestOffset)
+
         const contents = range.cloneContents()
         const removals = [
           ...Array.prototype.slice.call(
@@ -510,22 +508,26 @@ export const ReactEditor = {
         }
       }
 
-      // COMPAT: If the parent node is a Slate zero-width space, editor is
-      // because the text node should have no characters. However, during IME
-      // composition the ASCII characters will be prepended to the zero-width
-      // space, so subtract 1 from the offset to account for the zero-width
-      // space character.
       if (
         domNode &&
         offset === domNode.textContent!.length &&
-        parentNode.hasAttribute('data-slate-zero-width')
+        // COMPAT: If the parent node is a Slate zero-width space, editor is
+        // because the text node should have no characters. However, during IME
+        // composition the ASCII characters will be prepended to the zero-width
+        // space, so subtract 1 from the offset to account for the zero-width
+        // space character.
+        (parentNode.hasAttribute('data-slate-zero-width') ||
+          // COMPAT: In Firefox, `range.cloneContents()` returns an extra trailing '\n'
+          // when the document ends with a new-line character. This results in the offset
+          // length being off by one, so we need to subtract one to account for this.
+          (IS_FIREFOX && domNode.textContent?.endsWith('\n\n')))
       ) {
         offset--
       }
     }
 
     if (!textNode) {
-      if (exactMatch) {
+      if (suppressThrow) {
         return null as T extends true ? Point | null : Point
       }
       throw new Error(
@@ -550,9 +552,10 @@ export const ReactEditor = {
     domRange: DOMRange | DOMStaticRange | DOMSelection,
     options: {
       exactMatch: T
+      suppressThrow: T
     }
   ): T extends true ? Range | null : Range {
-    const { exactMatch } = options
+    const { exactMatch, suppressThrow } = options
     const el = isDOMSelection(domRange)
       ? domRange.anchorNode
       : domRange.startContainer
@@ -602,7 +605,7 @@ export const ReactEditor = {
     const anchor = ReactEditor.toSlatePoint(
       editor,
       [anchorNode, anchorOffset],
-      exactMatch
+      { exactMatch, suppressThrow }
     )
     if (!anchor) {
       return null as T extends true ? Range | null : Range
@@ -610,14 +613,29 @@ export const ReactEditor = {
 
     const focus = isCollapsed
       ? anchor
-      : ReactEditor.toSlatePoint(editor, [focusNode, focusOffset], exactMatch)
+      : ReactEditor.toSlatePoint(editor, [focusNode, focusOffset], {
+          exactMatch,
+          suppressThrow,
+        })
     if (!focus) {
       return null as T extends true ? Range | null : Range
     }
 
-    return ({ anchor, focus } as unknown) as T extends true
-      ? Range | null
-      : Range
+    let range: Range = { anchor: anchor as Point, focus: focus as Point }
+    // if the selection is a hanging range that ends in a void
+    // and the DOM focus is an Element
+    // (meaning that the selection ends before the element)
+    // unhang the range to avoid mistakenly including the void
+    if (
+      Range.isExpanded(range) &&
+      Range.isForward(range) &&
+      isDOMElement(focusNode) &&
+      Editor.void(editor, { at: range.focus, mode: 'highest' })
+    ) {
+      range = Editor.unhangRange(editor, range, { voids: true })
+    }
+
+    return (range as unknown) as T extends true ? Range | null : Range
   },
 
   hasRange(editor: ReactEditor, range: Range): boolean {

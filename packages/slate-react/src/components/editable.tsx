@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useMemo, useCallback } from 'react'
+import React, { useEffect, useRef, useMemo, useCallback, useState } from 'react'
 import {
   Editor,
   Element,
@@ -17,9 +17,11 @@ import useChildren from '../hooks/use-children'
 import Hotkeys from '../utils/hotkeys'
 import {
   HAS_BEFORE_INPUT_SUPPORT,
+  IS_IOS,
   IS_CHROME,
   IS_FIREFOX,
   IS_FIREFOX_LEGACY,
+  IS_QQBROWSER,
   IS_SAFARI,
 } from '../utils/environment'
 import { ReactEditor } from '..'
@@ -46,6 +48,11 @@ import {
   PLACEHOLDER_SYMBOL,
   EDITOR_TO_WINDOW,
 } from '../utils/weak-maps'
+import { asNative, flushNativeEvents } from '../utils/native'
+
+const Children = (props: Parameters<typeof useChildren>[0]) => (
+  <React.Fragment>{useChildren(props)}</React.Fragment>
+)
 
 /**
  * `RenderElementProps` are passed to the `renderElement` handler.
@@ -90,6 +97,7 @@ export type EditableProps = {
   renderElement?: (props: RenderElementProps) => JSX.Element
   renderLeaf?: (props: RenderLeafProps) => JSX.Element
   renderPlaceholder?: (props: RenderPlaceholderProps) => JSX.Element
+  scrollSelectionIntoView?: (editor: ReactEditor, domRange: DOMRange) => void
   as?: React.ElementType
 } & React.TextareaHTMLAttributes<HTMLDivElement>
 
@@ -107,11 +115,14 @@ export const Editable = (props: EditableProps) => {
     renderElement,
     renderLeaf,
     renderPlaceholder = props => <DefaultPlaceholder {...props} />,
+    scrollSelectionIntoView = defaultScrollSelectionIntoView,
     style = {},
     as: Component = 'div',
     ...attributes
   } = props
   const editor = useSlate()
+  // Rerender editor when composition status changed
+  const [isComposing, setIsComposing] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
   // Update internal state on each render.
@@ -121,6 +132,7 @@ export const Editable = (props: EditableProps) => {
   const state = useMemo(
     () => ({
       isComposing: false,
+      hasInsertPrefixInCompositon: false,
       isDraggingInternally: false,
       isUpdatingSelection: false,
       latestElement: null as DOMElement | null,
@@ -170,7 +182,11 @@ export const Editable = (props: EditableProps) => {
     // If the DOM selection is in the editor and the editor selection is already correct, we're done.
     if (hasDomSelection && hasDomSelectionInEditor && selection) {
       const slateRange = ReactEditor.toSlateRange(editor, domSelection, {
-        exactMatch: true,
+        exactMatch: false,
+
+        // domSelection is not necessarily a valid Slate range
+        // (e.g. when clicking on contentEditable:false element)
+        suppressThrow: true,
       })
       if (slateRange && Range.equals(slateRange, selection)) {
         return
@@ -184,12 +200,12 @@ export const Editable = (props: EditableProps) => {
     if (selection && !ReactEditor.hasRange(editor, selection)) {
       editor.selection = ReactEditor.toSlateRange(editor, domSelection, {
         exactMatch: false,
+        suppressThrow: false,
       })
       return
     }
 
     // Otherwise the DOM selection is out of sync, so update it.
-    const el = ReactEditor.toDOMNode(editor, editor)
     state.isUpdatingSelection = true
 
     const newDomRange = selection && ReactEditor.toDOMRange(editor, selection)
@@ -210,16 +226,7 @@ export const Editable = (props: EditableProps) => {
           newDomRange.endOffset
         )
       }
-      const leafEl = newDomRange.startContainer.parentElement!
-      leafEl.getBoundingClientRect = newDomRange.getBoundingClientRect.bind(
-        newDomRange
-      )
-      scrollIntoView(leafEl, {
-        scrollMode: 'if-needed',
-        boundary: el,
-      })
-      // @ts-ignore
-      delete leafEl.getBoundingClientRect
+      scrollSelectionIntoView(editor, newDomRange)
     } else {
       domSelection.removeAllRanges()
     }
@@ -228,6 +235,7 @@ export const Editable = (props: EditableProps) => {
       // COMPAT: In Firefox, it's not enough to create a range, you also need
       // to focus the contenteditable element too. (2016/11/16)
       if (newDomRange && IS_FIREFOX) {
+        const el = ReactEditor.toDOMNode(editor, editor)
         el.focus()
       }
 
@@ -267,7 +275,49 @@ export const Editable = (props: EditableProps) => {
           return
         }
 
-        event.preventDefault()
+        let native = false
+        if (
+          type === 'insertText' &&
+          selection &&
+          Range.isCollapsed(selection) &&
+          // Only use native character insertion for single characters a-z or space for now.
+          // Long-press events (hold a + press 4 = ä) to choose a special character otherwise
+          // causes duplicate inserts.
+          event.data &&
+          event.data.length === 1 &&
+          /[a-z ]/i.test(event.data) &&
+          // Chrome seems to have issues correctly editing the start of nodes.
+          // When there is an inline element, e.g. a link, and you select
+          // right after it (the start of the next node).
+          selection.anchor.offset !== 0
+        ) {
+          native = true
+
+          // Skip native if there are marks, as
+          // `insertText` will insert a node, not just text.
+          if (editor.marks) {
+            native = false
+          }
+
+          // and because of the selection moving in `insertText` (create-editor.ts).
+          const { anchor } = selection
+          const inline = Editor.above(editor, {
+            at: anchor,
+            match: n => Editor.isInline(editor, n),
+            mode: 'highest',
+          })
+          if (inline) {
+            const [, inlinePath] = inline
+
+            if (Editor.isEnd(editor, selection.anchor, inlinePath)) {
+              native = false
+            }
+          }
+        }
+
+        if (!native) {
+          event.preventDefault()
+        }
 
         // COMPAT: For the deleting forward/backward input types we don't want
         // to change the selection because it is the range that will be deleted,
@@ -278,6 +328,7 @@ export const Editable = (props: EditableProps) => {
           if (targetRange) {
             const range = ReactEditor.toSlateRange(editor, targetRange, {
               exactMatch: false,
+              suppressThrow: false,
             })
 
             if (!selection || !Range.equals(selection, range)) {
@@ -371,6 +422,7 @@ export const Editable = (props: EditableProps) => {
               // then we will abort because we're still composing and the selection
               // won't be updated properly.
               // https://www.w3.org/TR/input-events-2/
+              state.isComposing && setIsComposing(false)
               state.isComposing = false
             }
 
@@ -378,7 +430,15 @@ export const Editable = (props: EditableProps) => {
             if (data instanceof window.DataTransfer) {
               ReactEditor.insertData(editor, data as DataTransfer)
             } else if (typeof data === 'string') {
-              Editor.insertText(editor, data)
+              // Only insertText operations use the native functionality, for now.
+              // Potentially expand to single character deletes, as well.
+              if (native) {
+                asNative(editor, () => Editor.insertText(editor, data), {
+                  onFlushed: () => event.preventDefault(),
+                })
+              } else {
+                Editor.insertText(editor, data)
+              }
             }
 
             break
@@ -449,14 +509,18 @@ export const Editable = (props: EditableProps) => {
         if (anchorNodeSelectable && focusNodeSelectable) {
           const range = ReactEditor.toSlateRange(editor, domSelection, {
             exactMatch: false,
+            suppressThrow: false,
           })
           Transforms.select(editor, range)
-        } else {
-          Transforms.deselect(editor)
         }
       }
     }, 100),
     [readOnly]
+  )
+
+  const scheduleOnDOMSelectionChange = useCallback(
+    () => setTimeout(onDOMSelectionChange),
+    [onDOMSelectionChange]
   )
 
   // Attach a native DOM event handler for `selectionchange`, because React's
@@ -466,15 +530,18 @@ export const Editable = (props: EditableProps) => {
   // https://github.com/facebook/react/issues/5785
   useIsomorphicLayoutEffect(() => {
     const window = ReactEditor.getWindow(editor)
-    window.document.addEventListener('selectionchange', onDOMSelectionChange)
+    window.document.addEventListener(
+      'selectionchange',
+      scheduleOnDOMSelectionChange
+    )
 
     return () => {
       window.document.removeEventListener(
         'selectionchange',
-        onDOMSelectionChange
+        scheduleOnDOMSelectionChange
       )
     }
-  }, [onDOMSelectionChange])
+  }, [scheduleOnDOMSelectionChange])
 
   const decorations = decorate([editor, []])
 
@@ -482,7 +549,8 @@ export const Editable = (props: EditableProps) => {
     placeholder &&
     editor.children.length === 1 &&
     Array.from(Node.texts(editor)).length === 1 &&
-    Node.string(editor) === ''
+    Node.string(editor) === '' &&
+    !isComposing
   ) {
     const start = Editor.start(editor, [])
     decorations.push({
@@ -549,6 +617,13 @@ export const Editable = (props: EditableProps) => {
             },
             [readOnly]
           )}
+          onInput={useCallback((event: React.SyntheticEvent) => {
+            // Flush native operations, as native events will have propogated
+            // and we can correctly compare DOM text values in components
+            // to stop rendering, so that browser functions like autocorrect
+            // and spellcheck work as expected.
+            flushNativeEvents(editor)
+          }, [])}
           onBlur={useCallback(
             (event: React.FocusEvent<HTMLDivElement>) => {
               if (
@@ -649,14 +724,38 @@ export const Editable = (props: EditableProps) => {
                 hasEditableTarget(editor, event.target) &&
                 !isEventHandled(event, attributes.onCompositionEnd)
               ) {
+                state.isComposing && setIsComposing(false)
                 state.isComposing = false
 
                 // COMPAT: In Chrome, `beforeinput` events for compositions
                 // aren't correct and never fire the "insertFromComposition"
                 // type that we need. So instead, insert whenever a composition
                 // ends since it will already have been committed to the DOM.
-                if (!IS_SAFARI && !IS_FIREFOX_LEGACY && event.data) {
+                if (
+                  !IS_SAFARI &&
+                  !IS_FIREFOX_LEGACY &&
+                  !IS_IOS &&
+                  !IS_QQBROWSER &&
+                  event.data
+                ) {
                   Editor.insertText(editor, event.data)
+                }
+
+                if (editor.selection && Range.isCollapsed(editor.selection)) {
+                  const leafPath = editor.selection.anchor.path
+                  const currentTextNode = Node.leaf(editor, leafPath)
+                  if (state.hasInsertPrefixInCompositon) {
+                    state.hasInsertPrefixInCompositon = false
+                    Editor.withoutNormalizing(editor, () => {
+                      // remove Unicode BOM prefix added in `onCompositionStart`
+                      const text = currentTextNode.text.replace(/^\uFEFF/, '')
+                      Transforms.delete(editor, {
+                        distance: currentTextNode.text.length,
+                        reverse: true,
+                      })
+                      Transforms.insertText(editor, text)
+                    })
+                  }
                 }
               }
             },
@@ -668,6 +767,7 @@ export const Editable = (props: EditableProps) => {
                 hasEditableTarget(editor, event.target) &&
                 !isEventHandled(event, attributes.onCompositionUpdate)
               ) {
+                !state.isComposing && setIsComposing(true)
                 state.isComposing = true
               }
             },
@@ -679,9 +779,42 @@ export const Editable = (props: EditableProps) => {
                 hasEditableTarget(editor, event.target) &&
                 !isEventHandled(event, attributes.onCompositionStart)
               ) {
-                const { selection } = editor
-                if (selection && Range.isExpanded(selection)) {
-                  Editor.deleteFragment(editor)
+                const { selection, marks } = editor
+                if (selection) {
+                  if (Range.isExpanded(selection)) {
+                    Editor.deleteFragment(editor)
+                    return
+                  }
+                  const inline = Editor.above(editor, {
+                    match: n => Editor.isInline(editor, n),
+                    mode: 'highest',
+                  })
+                  if (inline) {
+                    const [, inlinePath] = inline
+                    if (Editor.isEnd(editor, selection.anchor, inlinePath)) {
+                      const point = Editor.after(editor, inlinePath)!
+                      Transforms.setSelection(editor, {
+                        anchor: point,
+                        focus: point,
+                      })
+                    }
+                  }
+                  // insert new node in advance to ensure composition text will insert
+                  // along with final input text
+                  // add Unicode BOM prefix to avoid normalize removing this node
+                  if (marks) {
+                    state.hasInsertPrefixInCompositon = true
+                    Transforms.insertNodes(
+                      editor,
+                      {
+                        text: '\uFEFF',
+                        ...marks,
+                      },
+                      {
+                        select: true,
+                      }
+                    )
+                  }
                 }
               }
             },
@@ -852,6 +985,7 @@ export const Editable = (props: EditableProps) => {
             (event: React.KeyboardEvent<HTMLDivElement>) => {
               if (
                 !readOnly &&
+                !state.isComposing &&
                 hasEditableTarget(editor, event.target) &&
                 !isEventHandled(event, attributes.onKeyDown)
               ) {
@@ -1086,7 +1220,7 @@ export const Editable = (props: EditableProps) => {
                         Editor.isInline(editor, currentNode)
                       ) {
                         event.preventDefault()
-                        Transforms.delete(editor, { unit: 'block' })
+                        Editor.deleteBackward(editor, { unit: 'block' })
 
                         return
                       }
@@ -1120,14 +1254,14 @@ export const Editable = (props: EditableProps) => {
             [readOnly, attributes.onPaste]
           )}
         >
-          {useChildren({
-            decorations,
-            node: editor,
-            renderElement,
-            renderPlaceholder,
-            renderLeaf,
-            selection: editor.selection,
-          })}
+          <Children
+            decorations={decorations}
+            node={editor}
+            renderElement={renderElement}
+            renderPlaceholder={renderPlaceholder}
+            renderLeaf={renderLeaf}
+            selection={editor.selection}
+          />
         </Component>
       </DecorateContext.Provider>
     </ReadOnlyContext.Provider>
@@ -1162,6 +1296,22 @@ export const DefaultPlaceholder = ({
  */
 
 export const defaultDecorate: (entry: NodeEntry) => Range[] = () => []
+
+/**
+ * A default implement to scroll dom range into view.
+ */
+
+const defaultScrollSelectionIntoView = (
+  editor: ReactEditor,
+  domRange: DOMRange
+) => {
+  const leafEl = domRange.startContainer.parentElement!
+  leafEl.getBoundingClientRect = domRange.getBoundingClientRect.bind(domRange)
+  scrollIntoView(leafEl, {
+    scrollMode: 'if-needed',
+  })
+  delete leafEl.getBoundingClientRect
+}
 
 /**
  * Check if two DOM range objects are equal.

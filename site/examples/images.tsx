@@ -19,7 +19,7 @@ import { ImageElement } from './custom-types'
 const ImagesExample = () => {
   const [value, setValue] = useState<Descendant[]>(initialValue)
   const editor = useMemo(
-    () => withImages(withHistory(withReact(createEditor()))),
+    () => withImages(withReact(withHistory(createEditor()))),
     []
   )
 
@@ -93,6 +93,7 @@ const Image = ({ attributes, children, element }) => {
   const focused = useFocused()
   return (
     <div {...attributes}>
+      {children}
       <div contentEditable={false}>
         <img
           src={element.url}
@@ -104,7 +105,6 @@ const Image = ({ attributes, children, element }) => {
           `}
         />
       </div>
-      {children}
     </div>
   )
 }
